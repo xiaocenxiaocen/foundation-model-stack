@@ -2,16 +2,18 @@ import torch
 import triton
 from triton import language as tl
 import sys
-import marlin 
+import marlin
 import torch.nn as nn
 from auto_gptq.utils.import_utils import dynamically_import_QuantLinear
 from auto_gptq.modeling._utils import autogptq_post_init
+import time
+
 
 @triton.jit()
 def swizzle_tile(pid,
                 m, n,
                 block_m: tl.constexpr, block_n: tl.constexpr, group_m: tl.constexpr):
-    
+
     grid_m = tl.cdiv(m, block_m)
     grid_n = tl.cdiv(n, block_n)
 
@@ -37,7 +39,7 @@ def matmul_data_parallel_kernel(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr,
                              block_size_m: tl.constexpr, block_size_n: tl.constexpr, block_size_k: tl.constexpr,
                              group_size_m: tl.constexpr,
                              fp8_fast_accum: tl.constexpr,):
-    
+
     pid = tl.program_id(0)
     total_blocks_m = tl.cdiv(m, block_size_m)
     total_blocks_n = tl.cdiv(n, block_size_n)
@@ -56,10 +58,10 @@ def matmul_data_parallel_kernel(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr,
     offs_am = tl.max_contiguous(tl.multiple_of(offs_m, block_size_m), block_size_m)
     offs_bn = tl.max_contiguous(tl.multiple_of(offs_n, block_size_n), block_size_n)
     offs_k = tl.arange(0, block_size_k)
-    
+
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak) # (16, 64)
     b_ptrs = b_ptr + ((offs_k[:, None] // 8) * stride_bk + offs_bn[None, :] * stride_bn)
-    
+
     scales_ptrs = scales_ptr + offs_bn * stride_scales_n
     zeros_ptrs = zeros_ptr + ((offs_bn // 8) * stride_zeros_n)
 
@@ -69,7 +71,7 @@ def matmul_data_parallel_kernel(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr,
     output = tl.zeros((block_size_m, block_size_n), dtype=tl.float32)
     for k in range(0, total_blocks_k):
 
- 
+
         a = tl.load(a_ptrs)
         b = tl.load(b_ptrs)
 
@@ -79,7 +81,7 @@ def matmul_data_parallel_kernel(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr,
 
         ptr = scales_ptrs + g_id * stride_scales_g
         scales = tl.load(ptr)
-        
+
         ptr = zeros_ptrs + g_id * stride_zeros_g
         zeros = tl.load(ptr)
 
@@ -88,7 +90,7 @@ def matmul_data_parallel_kernel(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr,
 
         b = (b >> shifter[:, None]) & 0xF # b is int32
         b = b * scales[None, :] - zeros[None, :] # b is fp16
-        
+
         # output +=  tl.dot(a, b)
         # output += tl.sum(a, b, axis=0)
         # print(b.type)
@@ -99,7 +101,7 @@ def matmul_data_parallel_kernel(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr,
         # a_block_ptr = tl.advance(a_block_ptr, (0, block_size_k))
         a_ptrs += stride_ak * block_size_k
         b_ptrs += (block_size_k//8) * stride_bk
-    
+
     output.to(tl.float16)
     offs_cm = pid_m * block_size_m + tl.arange(0, block_size_m)
     offs_cn = pid_n * block_size_n + tl.arange(0, block_size_n)
@@ -140,19 +142,19 @@ class small_qlinear(torch.autograd.Function):
             num_warps = num_warps, num_stages = num_stages,
         )
 
-        print(f"{k.n_regs} registers used, {k.n_spills} spills, {k.shared/1000} kB shared memory\n")
+        #print(f"{k.n_regs} registers used, {k.n_spills} spills, {k.shared/1000} kB shared memory\n")
 
-        with open('dequant_simple.txt', 'w') as f:
+        #with open('dequant_simple.txt', 'w') as f:
 
-            print(f"{k.n_regs} registers used, {k.n_spills} spills, {k.shared/1000} kB shared memory\n", file=f)
-            print("IR", k.asm['ttir'], file=f)
-            print("TTGIR", k.asm['ttgir'], file=f)
-            print("PTX", k.asm['ptx'], file=f)
-            print(f"{k.n_regs} registers used, {k.n_spills} spills, {k.shared/1000} kB shared memory\n", file=f)
+        #    print(f"{k.n_regs} registers used, {k.n_spills} spills, {k.shared/1000} kB shared memory\n", file=f)
+        #    print("IR", k.asm['ttir'], file=f)
+        #    print("TTGIR", k.asm['ttgir'], file=f)
+        #    print("PTX", k.asm['ptx'], file=f)
+        #    print(f"{k.n_regs} registers used, {k.n_spills} spills, {k.shared/1000} kB shared memory\n", file=f)
 
-            print(f"{total_blocks_m=} x {total_blocks_n=} = {total_programs=}")
+        #    print(f"{total_blocks_m=} x {total_blocks_n=} = {total_programs=}")
         return c
-        
+
 
 matmul_data_parallel = small_qlinear.apply
 
@@ -168,7 +170,7 @@ def matmul_split_k_kernel(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr,
             m, n, k,
             block_m: tl.constexpr, block_n: tl.constexpr, block_k: tl.constexpr,
             group_m: tl.constexpr, split_k: tl.constexpr):
-    
+
     pid = tl.program_id(0)
     pid_k = tl.program_id(1)
     num_pid_k = tl.cdiv(k, block_k*split_k)
@@ -176,13 +178,13 @@ def matmul_split_k_kernel(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr,
     pid_m, pid_n = swizzle_tile(pid,
                                 m, n,
                                 block_m, block_n, group_m)
-    
+
     offs_m = pid_m*block_m + tl.arange(0, block_m)
     offs_n = pid_n*block_n + tl.arange(0, block_n)
     offs_k = pid_k*block_k + tl.arange(0, block_k)
 
     offs_am = tl.max_contiguous(tl.multiple_of(offs_m, block_m), block_m)
-    offs_bn = tl.max_contiguous(tl.multiple_of(offs_n, block_n), block_n) 
+    offs_bn = tl.max_contiguous(tl.multiple_of(offs_n, block_n), block_n)
 
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + ((offs_k[:, None] // 8) * stride_bk + offs_bn[None, :] * stride_bn)
@@ -192,18 +194,18 @@ def matmul_split_k_kernel(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr,
 
     shifter = (offs_k % 8) * 4
     zeros_shifter = (offs_bn % 8) * 4
-    
+
     acc = tl.zeros((block_m, block_n), dtype=tl.float32)
     for k in range(0, num_pid_k):
-        
+
         a = tl.load(a_ptrs)
         b = tl.load(b_ptrs)
-        
-        g_id = k // (groupsize // (block_k*split_k)) 
+
+        g_id = k // (groupsize // (block_k*split_k))
 
         ptr = scales_ptrs + g_id * stride_scales_g
         scales = tl.load(ptr) # -> 1D naive assumes no reordering
-        
+
         ptr = zeros_ptrs + g_id * stride_zeros_g
         zeros = tl.load(ptr) # -> 1D naive assumes no reordering
 
@@ -229,7 +231,7 @@ def matmul_split_k(a, b, scales, zeros):
 
     m, k = a.shape
     _, n = b.shape
-    
+
     quant_groupsize = 128
     block_m = 16
     block_n = 32
@@ -243,7 +245,7 @@ def matmul_split_k(a, b, scales, zeros):
     total_blocks_n = triton.cdiv(n, block_n)
     total_programs_mn = total_blocks_m * total_blocks_n
     total_programs_k = split_k
-    
+
     grid = (total_programs_mn, total_programs_k)
 
     # print(f"problem m size: {m}, tile size m: {block_m}, total blocks m: {total_blocks_m}")
@@ -253,7 +255,7 @@ def matmul_split_k(a, b, scales, zeros):
 
 
     # print(f"{total_programs_mn=}, {total_programs_k=}")
-    
+
     c = torch.zeros((m, n), device=a.device, dtype=torch.float16)
     k = matmul_split_k_kernel[grid](a, b, c, scales, zeros,
                               a.stride(0), a.stride(1),
@@ -265,7 +267,7 @@ def matmul_split_k(a, b, scales, zeros):
                               m, n, k,
                               block_m, block_n, block_k,
                               group_m, split_k, num_stages=num_stages, num_warps=num_warps)
-    
+
     # print(f"{k.n_regs} registers used, {k.n_spills} spills, {k.shared/1000} kB shared memory\n")
 
     # with open('matmul_split_k.txt', 'w') as f:
@@ -328,10 +330,71 @@ def gen_quant4(m, n, groupsize=-1):
     s = layer.s
     return ref, q, s
 
-if __name__ == '__main__':
 
-    m = 16
-    k = 4096
+def benchmark(f, warmup=10, iter=100):
+    for i in range(warmup + iter):
+        f()
+        # We do not synchronize here in order to hide the kernel launch overhead during benchmarkining as this will also
+        # happen during realistic model inference as many launches are submitted to the kernel queue.
+        if i == warmup - 1:
+            torch.cuda.synchronize()
+            tick = time.time()
+    torch.cuda.synchronize()
+    res = (time.time() - tick) / iter
+    # Make sure there is enough to "cool down" the GPU in between benchmarks to avoid throttling for later runs when
+    # we execute many benchmarks consecutively
+    time.sleep(1.)
+    return res
+
+
+def get_problem(m, n, k, groupsize=-1):
+    if groupsize == -1:
+        groupsize = k
+    dev = torch.device('cuda:0')
+    A = torch.randn((m, k), dtype=torch.half, device=dev)
+    B = torch.randint(low=-2**31, high=2**31, size=(k//8, n), device=dev)
+    B_ref = torch.randn((k, n), dtype=torch.half, device=dev)
+    C = torch.zeros((m, n), dtype=torch.half, device=dev)
+    s = torch.zeros((k // groupsize, n), dtype=torch.half, device=dev)
+    z = torch.zeros((k // groupsize, n//8), dtype=torch.int32, device=dev)
+    torch.cuda.synchronize()
+    return A, B, C, B_ref, s, z
+
+
+def benchmark_dense(A, B, C):
+    res = benchmark(lambda: torch.matmul(A, B, out=C))
+    return {
+        's': res,
+        'TFLOP/s': 2 * A.numel() * C.shape[1] / res / 10 ** 12,
+        'GB/s': (2 * A.numel() + 2 * B.numel() + 2 * C.numel()) / res / 10 ** 9
+    }
+
+
+def benchmark_quant(A, B, C, s, z, thread_k, thread_n, sms, func=None):
+    workspace = torch.zeros(C.shape[1] // 128 * 16, device=torch.device('cuda:0'))
+    if func is None:
+        def wrapper():
+            marlin.mul(A, B, C, s, workspace, thread_k, thread_n, sms)
+        f = wrapper
+    else:
+        def wrapper():
+            func(A, B, s, z)
+        f = wrapper
+    try:
+        res = benchmark(f)
+    except RuntimeError:
+        import numpy as np
+        res = np.nan
+    return {
+        's': res,
+        'TFLOP/s': 2 * A.numel() * C.shape[1] / res / 10 ** 12,
+        'GB/s': (2 * A.numel() + 4 * B.numel() + 2 * C.numel() + 2 * s.numel()) / res / 10 ** 9
+    }
+
+
+def main():
+    m = 8
+    k = 4096 * 3
     n = 4096
     groupsize = 128
     g = k // groupsize
@@ -411,10 +474,110 @@ if __name__ == '__main__':
 
     for i in range(7):
         g.replay()  # This replays the captured operations in the graph
-        
+
 
     for i in range(7):
         matmul_data_parallel(a, b, scales, zeros)
 
     for i in range(7):
         matmul_split_k(a, b, scales, zeros)
+
+
+def main2():
+    # Pass the SM count for known GPUs to avoid the kernel having to query this information (this is very minor)
+    gpu = torch.cuda.get_device_name(0)
+    if 'A100' in gpu:
+        SMS = 108
+    elif 'A10' in gpu:
+        SMS = 72
+    elif '3090' in gpu:
+        SMS = 82
+    elif 'A6000' in gpu:
+        SMS = 84
+    else:
+        SMS = -1
+
+    SMS = 128
+
+    MODELS = {
+        #'ideal': [
+        #    (4 * 256 * SMS, 256 * SMS)
+        #],
+        'Llama7B': [
+            (4096, 3 * 4096),
+            (4096, 4096),
+            (4096, 2 * 10752),
+            (10752, 4096)
+        ],
+        'Llama13B': [
+            (5120, 3 * 5120),
+            (5120, 5120),
+            (5120, 2 * 13568),
+            (13568, 5120)
+        ],
+        'Llama33B': [
+            (6656, 3 * 6656),
+            (6656, 6656),
+#            (6656, 2 * 17664),
+            (17664, 6656)
+        ],
+        #'Llama65B': [
+        #    (8192, 3 * 8192),
+        #    (8192, 8192),
+        #    (8192, 2 * 21760),
+        #    (21760, 8192)
+        #],
+        'Falcon180B': [
+            # Note that parallel attention and FC allows layer fusions
+#            (14848, 14848 * 5 + 1024),
+            (14848 * 5, 14848)
+        ]
+    }
+
+    # Set to true in order to run a more complete benchmark sweep; the default is reproduce README experiments
+    ALL = False
+
+    func = matmul_split_k
+
+    for groupsize in [-1, 128] if ALL else [128]:
+        print('groupsize=%d' % groupsize)
+        print()
+        for model, layers in MODELS.items():
+            print(model)
+            if ALL:
+                batchsizes =  [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+            else:
+                batchsizes = [4, 8]
+            for batch in batchsizes:
+                #if not ALL and model != 'ideal' and batch not in [1]:
+                #    continue
+                tot_q = {'s': 0, 'TFLOP/s': 0, 'GB/s': 0, 'speedup': 0}
+                for layer in layers:
+                    A, B, C, B_ref, s, z = get_problem(batch, layer[1], layer[0], groupsize)
+                    res_d = benchmark_dense(A, B_ref, C)
+                    if model == 'ideal' and batch == 16:
+                        # This is a special case constructed to be optimal for a thread-shape different than the default one
+                        res_q = benchmark_quant(A, B, C, s, z, 64, 256, SMS, func=func)
+                    else:
+                        res_q = benchmark_quant(A, B, C, s, z, -1, -1, SMS, func=func)
+                    print(f"{batch}x{layer[1]}x{layer[0]}:{res_q['s']}")
+                    res_q['speedup'] = res_d['s'] / res_q['s']
+                    tot_q['s'] += res_q['s']
+                    for k in tot_q:
+                        if k != 's':
+                            tot_q[k] += res_q[k] * res_q['s']
+                for k in tot_q:
+                    if k != 's':
+                        tot_q[k] /= tot_q['s']
+                print('batch=%04d: s=%.5f, TFLOP/s=%07.3f, GB/s=%08.3f, speedup=%.2f' % (
+                    batch,
+                    tot_q['s'],
+                    tot_q['TFLOP/s'],
+                    tot_q['GB/s'],
+                    tot_q['speedup']
+                ))
+            print()
+
+
+if __name__ == "__main__":
+    main2()
