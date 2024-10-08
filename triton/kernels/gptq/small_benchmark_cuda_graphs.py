@@ -7,6 +7,7 @@ import torch.nn as nn
 from auto_gptq.utils.import_utils import dynamically_import_QuantLinear
 from auto_gptq.modeling._utils import autogptq_post_init
 import time
+from a100_qlinear import a100_qlinear
 
 
 @triton.jit()
@@ -41,9 +42,9 @@ def matmul_data_parallel_kernel(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr,
                              fp8_fast_accum: tl.constexpr,):
 
     pid = tl.program_id(0)
-    total_blocks_m = tl.cdiv(m, block_size_m)
-    total_blocks_n = tl.cdiv(n, block_size_n)
-    total_blocks_k = tl.cdiv(k, block_size_k)
+    total_blocks_m = tl.cdiv(M, block_size_m)
+    total_blocks_n = tl.cdiv(N, block_size_n)
+    total_blocks_k = tl.cdiv(K, block_size_k)
 
     num_blocks_in_group = group_size_m * total_blocks_n
     group_id = pid // num_blocks_in_group
@@ -115,12 +116,12 @@ class small_qlinear(torch.autograd.Function):
         _, n = b.shape
 
         quant_groupsize = 128
-        block_size_m = 64
-        block_size_n = 64 # [N = 4096 // 32] = 128 blocks
-        block_size_k = 64
+        block_size_m = 16
+        block_size_n = 32 # [N = 4096 // 32] = 128 blocks
+        block_size_k = 128
         group_size_m = 8
         num_warps = 4
-        num_stages = 8
+        num_stages = 3
         total_blocks_m = triton.cdiv(m, block_size_m)
         total_blocks_n = triton.cdiv(n, block_size_n)
         total_programs  = total_blocks_m * total_blocks_n
@@ -167,16 +168,16 @@ def matmul_split_k_kernel(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr,
             stride_scales_g, stride_scales_n,
             stride_zeros_g, stride_zeros_n,
             groupsize,
-            m, n, k,
+            M, N, K,
             block_m: tl.constexpr, block_n: tl.constexpr, block_k: tl.constexpr,
             group_m: tl.constexpr, split_k: tl.constexpr):
 
     pid = tl.program_id(0)
     pid_k = tl.program_id(1)
-    num_pid_k = tl.cdiv(k, block_k*split_k)
+    num_pid_k = tl.cdiv(K, block_k*split_k)
 
     pid_m, pid_n = swizzle_tile(pid,
-                                m, n,
+                                M, N,
                                 block_m, block_n, group_m)
 
     offs_m = pid_m*block_m + tl.arange(0, block_m)
@@ -188,6 +189,7 @@ def matmul_split_k_kernel(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr,
 
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + ((offs_k[:, None] // 8) * stride_bk + offs_bn[None, :] * stride_bn)
+    masks_am = offs_am < M
 
     scales_ptrs = scales_ptr + offs_bn * stride_scales_n
     zeros_ptrs = zeros_ptr + ((offs_bn // 8) * stride_zeros_n)
@@ -197,11 +199,12 @@ def matmul_split_k_kernel(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr,
 
     acc = tl.zeros((block_m, block_n), dtype=tl.float32)
     for k in range(0, num_pid_k):
-
-        a = tl.load(a_ptrs)
+        masks_k = offs_k < K
+        masks_a = masks_am[:, None] & masks_k[None, :]
+        a = tl.load(a_ptrs, mask=masks_a)
         b = tl.load(b_ptrs)
 
-        g_id = k // (groupsize // (block_k*split_k))
+        g_id = (k * block_k * split_k) // groupsize
 
         ptr = scales_ptrs + g_id * stride_scales_g
         scales = tl.load(ptr) # -> 1D naive assumes no reordering
@@ -216,6 +219,7 @@ def matmul_split_k_kernel(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr,
         b = b * scales[None, :] - zeros[None, :]
 
         acc += tl.dot(a, b)
+        offs_k += block_k * split_k
         a_ptrs += block_k * split_k * stride_ak
         b_ptrs += (block_k//8) * split_k * stride_bk
 
@@ -225,7 +229,8 @@ def matmul_split_k_kernel(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr,
     offs_cn = pid_n*block_n + tl.arange(0, block_n)
 
     c_ptrs = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-    tl.atomic_add(c_ptrs, acc)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.atomic_add(c_ptrs, acc, mask=c_mask)
 
 def matmul_split_k(a, b, scales, zeros):
 
@@ -347,12 +352,33 @@ def benchmark(f, warmup=10, iter=100):
     return res
 
 
+def bench(f, warmup=5, number=1, repeat=31):
+    import numpy as np
+
+    cache = torch.empty((int(256e6),), dtype=torch.int8, device='cuda')
+    start_event = [torch.cuda.Event(enable_timing=True) for i in range(repeat)]
+    end_event = [torch.cuda.Event(enable_timing=True) for i in range(repeat)]
+
+    for _ in range(warmup):
+        cache.zero_()
+        f()
+
+    for i in range(repeat):
+        cache.zero_()
+        start_event[i].record()
+        f()
+        end_event[i].record()
+    torch.cuda.synchronize()
+    times = np.array([s.elapsed_time(e) for s, e in zip(start_event, end_event)])
+    return np.mean(times).item()
+
+
 def get_problem(m, n, k, groupsize=-1):
     if groupsize == -1:
         groupsize = k
     dev = torch.device('cuda:0')
     A = torch.randn((m, k), dtype=torch.half, device=dev)
-    B = torch.randint(low=-2**31, high=2**31, size=(k//8, n), device=dev)
+    B = torch.randint(low=-3, high=3, size=(k//8, n), dtype=torch.int32, device=dev)
     B_ref = torch.randn((k, n), dtype=torch.half, device=dev)
     C = torch.zeros((m, n), dtype=torch.half, device=dev)
     s = torch.zeros((k // groupsize, n), dtype=torch.half, device=dev)
@@ -362,7 +388,7 @@ def get_problem(m, n, k, groupsize=-1):
 
 
 def benchmark_dense(A, B, C):
-    res = benchmark(lambda: torch.matmul(A, B, out=C))
+    res = bench(lambda: torch.matmul(A, B, out=C), repeat=100)
     return {
         's': res,
         'TFLOP/s': 2 * A.numel() * C.shape[1] / res / 10 ** 12,
@@ -380,11 +406,7 @@ def benchmark_quant(A, B, C, s, z, thread_k, thread_n, sms, func=None):
         def wrapper():
             func(A, B, s, z)
         f = wrapper
-    try:
-        res = benchmark(f)
-    except RuntimeError:
-        import numpy as np
-        res = np.nan
+    res = bench(f, repeat=100)
     return {
         's': res,
         'TFLOP/s': 2 * A.numel() * C.shape[1] / res / 10 ** 12,
@@ -500,44 +522,46 @@ def main2():
     SMS = 128
 
     MODELS = {
-        #'ideal': [
-        #    (4 * 256 * SMS, 256 * SMS)
+        'Llama70B': [
+            (8192, 8192),
+            (8192, 28672),
+            (28672, 8192),
+        ],
+        #'Llama7B': [
+        #    (4096, 3 * 4096),
+        #    (4096, 4096),
+        #    (4096, 2 * 10752),
+        #    (10752, 4096)
         #],
-        'Llama7B': [
-            (4096, 3 * 4096),
-            (4096, 4096),
-            (4096, 2 * 10752),
-            (10752, 4096)
-        ],
-        'Llama13B': [
-            (5120, 3 * 5120),
-            (5120, 5120),
-            (5120, 2 * 13568),
-            (13568, 5120)
-        ],
-        'Llama33B': [
-            (6656, 3 * 6656),
-            (6656, 6656),
-#            (6656, 2 * 17664),
-            (17664, 6656)
-        ],
-        #'Llama65B': [
-        #    (8192, 3 * 8192),
-        #    (8192, 8192),
-        #    (8192, 2 * 21760),
-        #    (21760, 8192)
+        #'Llama13B': [
+        #    (5120, 3 * 5120),
+        #    (5120, 5120),
+        #    (5120, 2 * 13568),
+        #    (13568, 5120)
         #],
-        'Falcon180B': [
-            # Note that parallel attention and FC allows layer fusions
-#            (14848, 14848 * 5 + 1024),
-            (14848 * 5, 14848)
-        ]
+        #'Llama33B': [
+        #    (6656, 3 * 6656),
+        #    (6656, 6656),
+#       #     (6656, 2 * 17664),
+        #    (17664, 6656)
+        #],
+        ##'Llama65B': [
+        ##    (8192, 3 * 8192),
+        ##    (8192, 8192),
+        ##    (8192, 2 * 21760),
+        ##    (21760, 8192)
+        ##],
+        #'Falcon180B': [
+        #    # Note that parallel attention and FC allows layer fusions
+#       #     (14848, 14848 * 5 + 1024),
+        #    (14848 * 5, 14848)
+        #]
     }
 
     # Set to true in order to run a more complete benchmark sweep; the default is reproduce README experiments
     ALL = False
 
-    func = matmul_split_k
+    func = small_qlinear
 
     for groupsize in [-1, 128] if ALL else [128]:
         print('groupsize=%d' % groupsize)
@@ -547,35 +571,24 @@ def main2():
             if ALL:
                 batchsizes =  [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
             else:
-                batchsizes = [4, 8]
+                batchsizes = [1, 8, 16, 32]
             for batch in batchsizes:
+                for layer in layers:
                 #if not ALL and model != 'ideal' and batch not in [1]:
                 #    continue
-                tot_q = {'s': 0, 'TFLOP/s': 0, 'GB/s': 0, 'speedup': 0}
-                for layer in layers:
                     A, B, C, B_ref, s, z = get_problem(batch, layer[1], layer[0], groupsize)
-                    res_d = benchmark_dense(A, B_ref, C)
                     if model == 'ideal' and batch == 16:
                         # This is a special case constructed to be optimal for a thread-shape different than the default one
                         res_q = benchmark_quant(A, B, C, s, z, 64, 256, SMS, func=func)
                     else:
+                        #try:
+                        #    func = matmul_data_parallel
+                        #    res_q = benchmark_quant(A, B, C, s, z, -1, -1, SMS, func=func)
+                        #except RuntimeError:
+                        #    pass
+                        func = matmul_split_k
                         res_q = benchmark_quant(A, B, C, s, z, -1, -1, SMS, func=func)
                     print(f"{batch}x{layer[1]}x{layer[0]}:{res_q['s']}")
-                    res_q['speedup'] = res_d['s'] / res_q['s']
-                    tot_q['s'] += res_q['s']
-                    for k in tot_q:
-                        if k != 's':
-                            tot_q[k] += res_q[k] * res_q['s']
-                for k in tot_q:
-                    if k != 's':
-                        tot_q[k] /= tot_q['s']
-                print('batch=%04d: s=%.5f, TFLOP/s=%07.3f, GB/s=%08.3f, speedup=%.2f' % (
-                    batch,
-                    tot_q['s'],
-                    tot_q['TFLOP/s'],
-                    tot_q['GB/s'],
-                    tot_q['speedup']
-                ))
             print()
 
 
